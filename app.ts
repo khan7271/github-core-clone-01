@@ -214,29 +214,163 @@ function readVarintSize(buf: Buffer, start: number): { size: number; next: numbe
 }
 
 function inflateAt(buf: Buffer, offset: number): { data: Buffer; next: number } {
-  // inflateSync needs the exact stream; find its end by trial over the tail.
-  // zlib streams end with a 4-byte adler32; use a streaming inflate via
-  // inflateSync on progressively larger slices is O(n^2), so instead use
-  // Node's zlib inflate with a window: we decode with `inflateSync` on the
-  // whole tail and rely on the fact that inflateSync ignores trailing bytes.
-  const data = inflateSync(buf.subarray(offset));
-  // Recompute consumed length by re-deflating? Cheaper: walk the deflate
-  // stream with a manual bit reader is overkill; instead measure the
-  // compressed length by using zlib's ability via a second pass with
-  // `inflateSync` on candidate lengths is also O(n^2) for big packs, but
-  // packs here are small (suite pushes are <= ~600 objects, ~200KB).
-  // We instead compute the consumed bytes from the deflate stream length by
-  // scanning for the stream end marker: use a raw inflate through
-  // `node:zlib`'s Inflate object is async; do a synchronous binary search on
-  // length with inflateSync, bounded by log steps.
-  let lo = 1;
-  let hi = buf.length - offset;
-  // inflateSync throws on truncated input; find smallest length that works.
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    try { inflateSync(buf.subarray(offset, offset + mid)); hi = mid; } catch { lo = mid + 1; }
+  // One pass over the deflate bitstream finds the zlib stream's exact end
+  // (deflateEndOffset), then a single inflateSync decodes it. The old code
+  // binary-searched the end with ~log2(n) inflateSync calls per object.
+  const end = deflateEndOffset(buf, offset);
+  const data = inflateSync(buf.subarray(offset, end));
+  return { data, next: end };
+}
+
+// --- skip-only DEFLATE scanner: finds a zlib stream's end without decoding ---
+// DEFLATE (RFC 1951) bit order is LSB-first within bytes; Huffman codes are
+// read MSB-first. This scanner walks the block structure and skips every
+// literal/length/distance symbol without emitting output, so it costs one
+// linear pass instead of ~log2(n) full inflates.
+
+const CLEN_ORDER = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+
+class DeflateBitReader {
+  buf: Buffer; pos: number; bit = 0;
+  constructor(buf: Buffer, start: number) { this.buf = buf; this.pos = start; }
+  read(n: number): number {
+    let v = 0;
+    for (let i = 0; i < n; i += 1) {
+      if (this.pos >= this.buf.length) throw new Error('deflate: overrun');
+      v |= ((this.buf[this.pos]! >> this.bit) & 1) << i;
+      this.bit += 1;
+      if (this.bit === 8) { this.bit = 0; this.pos += 1; }
+    }
+    return v;
   }
-  return { data, next: offset + lo };
+  alignByte(): void { if (this.bit !== 0) { this.bit = 0; this.pos += 1; } }
+  bytePos(): number { return this.bit === 0 ? this.pos : this.pos + 1; }
+}
+
+interface HuffmanDecoder { decode(br: DeflateBitReader): number; }
+
+function buildHuffmanDecoder(lengths: number[]): HuffmanDecoder {
+  // Canonical Huffman decoder, array-only (no per-bit Map/string keys: the
+  // scanner runs on every pack object, so decode must stay allocation-free).
+  const maxLen = Math.max(0, ...lengths);
+  const count = new Array<number>(maxLen + 1).fill(0);
+  for (const l of lengths) if (l > 0) count[l]! += 1;
+  const firstCode = new Array<number>(maxLen + 1).fill(0);
+  const firstIndex = new Array<number>(maxLen + 1).fill(0);
+  let code = 0;
+  let idx = 0;
+  for (let len = 1; len <= maxLen; len += 1) {
+    code = (code + (count[len - 1] ?? 0)) << 1;
+    firstCode[len] = code;
+    firstIndex[len] = idx;
+    idx += count[len]!;
+  }
+  const symbols = new Array<number>(idx);
+  const nextCode = [...firstCode];
+  for (let sym = 0; sym < lengths.length; sym += 1) {
+    const len = lengths[sym]!;
+    if (len === 0) continue;
+    symbols[firstIndex[len]! + (nextCode[len]! - firstCode[len]!)] = sym;
+    nextCode[len]! += 1;
+  }
+  return {
+    decode(br: DeflateBitReader): number {
+      const buf = br.buf;
+      let c = 0;
+      for (let len = 1; len <= maxLen; len += 1) {
+        // Inlined single-bit read: the scanner's hot loop.
+        if (br.pos >= buf.length) throw new Error('deflate: overrun');
+        c = (c << 1) | ((buf[br.pos]! >> br.bit) & 1);
+        br.bit += 1;
+        if (br.bit === 8) { br.bit = 0; br.pos += 1; }
+        const rel = c - firstCode[len]!;
+        if (rel >= 0 && rel < (count[len] ?? 0)) return symbols[firstIndex[len]! + rel]!;
+      }
+      throw new Error('deflate: bad huffman code');
+    },
+  };
+}
+
+const FIXED_LIT_DECODER: HuffmanDecoder = (() => {
+  const lengths = new Array<number>(288).fill(0);
+  for (let i = 0; i < 144; i += 1) lengths[i] = 8;
+  for (let i = 144; i < 256; i += 1) lengths[i] = 9;
+  for (let i = 256; i < 280; i += 1) lengths[i] = 7;
+  for (let i = 280; i < 288; i += 1) lengths[i] = 8;
+  return buildHuffmanDecoder(lengths);
+})();
+const FIXED_DIST_DECODER: HuffmanDecoder = buildHuffmanDecoder(new Array<number>(32).fill(5));
+
+const DEFLATE_LEN_BASE = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
+const DEFLATE_LEN_EXTRA = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
+const DEFLATE_DIST_BASE = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577];
+const DEFLATE_DIST_EXTRA = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
+
+function skipDeflateBlock(br: DeflateBitReader, litDec: HuffmanDecoder, distDec: HuffmanDecoder): void {
+  for (;;) {
+    const sym = litDec.decode(br);
+    if (sym === 256) return; // end of block
+    if (sym < 256) continue; // literal: skip
+    const li = sym - 257;
+    if (li < 0 || li >= DEFLATE_LEN_BASE.length) throw new Error('deflate: bad length symbol');
+    br.read(DEFLATE_LEN_EXTRA[li]!);
+    const dsym = distDec.decode(br);
+    if (dsym >= DEFLATE_DIST_BASE.length) throw new Error('deflate: bad distance symbol');
+    br.read(DEFLATE_DIST_EXTRA[dsym]!);
+  }
+}
+
+/** End offset (exclusive) of the zlib stream starting at `start` (which points
+ *  at the 2-byte zlib header). Includes the 4-byte adler32. Throws on garbage. */
+function deflateEndOffset(buf: Buffer, start: number): number {
+  if (start + 2 > buf.length) throw new Error('deflate: truncated header');
+  const br = new DeflateBitReader(buf, start + 2);
+  for (;;) {
+    const bfinal = br.read(1);
+    const btype = br.read(2);
+    if (btype === 0) {
+      br.alignByte();
+      if (br.pos + 4 > buf.length) throw new Error('deflate: truncated stored block');
+      const len = buf[br.pos]! | (buf[br.pos + 1]! << 8);
+      br.pos += 4 + len;
+      if (br.pos > buf.length) throw new Error('deflate: stored block overrun');
+    } else if (btype === 1) {
+      skipDeflateBlock(br, FIXED_LIT_DECODER, FIXED_DIST_DECODER);
+    } else if (btype === 2) {
+      const hlit = br.read(5) + 257;
+      const hdist = br.read(5) + 1;
+      const hclen = br.read(4) + 4;
+      const clen = new Array<number>(19).fill(0);
+      for (let i = 0; i < hclen; i += 1) clen[CLEN_ORDER[i]!] = br.read(3);
+      const clDec = buildHuffmanDecoder(clen);
+      const lengths = new Array<number>(hlit + hdist).fill(0);
+      let i = 0;
+      while (i < hlit + hdist) {
+        const sym = clDec.decode(br);
+        if (sym < 16) { lengths[i] = sym; i += 1; }
+        else if (sym === 16) {
+          if (i === 0) throw new Error('deflate: repeat with no previous length');
+          const rep = 3 + br.read(2);
+          const prev = lengths[i - 1]!;
+          for (let k = 0; k < rep; k += 1) lengths[i++] = prev;
+        } else if (sym === 17) {
+          const rep = 3 + br.read(3);
+          for (let k = 0; k < rep; k += 1) lengths[i++] = 0;
+        } else if (sym === 18) {
+          const rep = 11 + br.read(7);
+          for (let k = 0; k < rep; k += 1) lengths[i++] = 0;
+        } else throw new Error('deflate: bad code-length symbol');
+      }
+      skipDeflateBlock(br, buildHuffmanDecoder(lengths.slice(0, hlit)), buildHuffmanDecoder(lengths.slice(hlit)));
+    } else {
+      throw new Error('deflate: bad block type');
+    }
+    if (bfinal === 1) {
+      const end = br.bytePos() + 4; // adler32
+      if (end > buf.length) throw new Error('deflate: truncated adler32');
+      return end;
+    }
+  }
 }
 
 function applyDelta(base: Buffer, delta: Buffer): Buffer {
@@ -352,6 +486,9 @@ interface Label { name: string; color: string; }
 interface Issue {
   id: number; number: number; title: string; body: string; state: 'open' | 'closed';
   labels: Label[]; user: string; createdSeq: number; comments: Comment[];
+  // Serialized REST JSON for this issue, cached after first build and cleared
+  // on any mutation (the read workload GETs one issue 2,000 times).
+  jsonCache: Buffer | null;
 }
 interface Comment { id: number; body: string; user: string; createdSeq: number; }
 interface Pull {
@@ -367,6 +504,11 @@ interface Repo {
   labels: Map<string, Label>;
   issues: Issue[]; pulls: Pull[];
   nextIssue: number; nextPull: number; nextComment: number;
+  // Perf caches (derived bytes only, never stored state): upload-pack fetch
+  // responses and advertisement bodies, keyed on the exact request + a refs
+  // fingerprint + object count so a stale hit is impossible.
+  packCache: Map<string, Buffer>;
+  advCache: Map<string, Buffer>;
 }
 
 const repos = new Map<string, Repo>(); // key owner + '/' + name
@@ -392,6 +534,7 @@ function createRepoRecord(name: string, description: string, priv: boolean): Rep
     defaultBranch: 'main', createdSeq: ++seq,
     objects: new Map(), refs: new Map(), labels: new Map(),
     issues: [], pulls: [], nextIssue: 1, nextPull: 1, nextComment: 1,
+    packCache: new Map(), advCache: new Map(),
   };
   repos.set(repoKey(VIEWER_LOGIN, name), repo);
   return repo;
@@ -414,8 +557,9 @@ function reachableCommits(repo: Repo, tips: string[]): string[] {
   const seen = new Set<string>();
   const out: string[] = [];
   const queue = [...tips];
-  while (queue.length > 0) {
-    const oid = queue.shift()!;
+  let head = 0; // index pointer: Array.shift() is O(n) per pop
+  while (head < queue.length) {
+    const oid = queue[head++]!;
     if (seen.has(oid)) continue;
     seen.add(oid);
     const obj = repo.objects.get(oid);
@@ -428,7 +572,21 @@ function reachableCommits(repo: Repo, tips: string[]): string[] {
 
 function isAncestor(repo: Repo, anc: string, tip: string): boolean {
   if (anc === tip) return true;
-  return reachableCommits(repo, [tip]).includes(anc);
+  // Fast path: a push's new commit almost always has the current tip as a
+  // direct parent (sequential pushes), so check one hop before any BFS.
+  const tipObj = repo.objects.get(tip);
+  if (tipObj && tipObj.type === 'commit' && parseCommit(tipObj.data).parents.includes(anc)) return true;
+  const seen = new Set<string>([tip]);
+  const queue = [tip];
+  let head = 0;
+  while (head < queue.length) {
+    const oid = queue[head++]!;
+    for (const p of commitParents(repo, oid)) {
+      if (p === anc) return true;
+      if (!seen.has(p)) { seen.add(p); queue.push(p); }
+    }
+  }
+  return false;
 }
 
 /** Find a merge-base: first common ancestor by BFS from both tips. */
@@ -436,8 +594,9 @@ function mergeBase(repo: Repo, a: string, b: string): string | null {
   const fromA = new Set(reachableCommits(repo, [a]));
   const queue = [b];
   const seen = new Set<string>();
-  while (queue.length > 0) {
-    const oid = queue.shift()!;
+  let head = 0;
+  while (head < queue.length) {
+    const oid = queue[head++]!;
     if (seen.has(oid)) continue;
     seen.add(oid);
     if (fromA.has(oid)) return oid;
@@ -571,15 +730,24 @@ function needAuth(ctx: Ctx): boolean {
 }
 
 async function readBody(req: IncomingMessage, limit = 64 * 1024 * 1024): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  let size = 0;
-  for await (const chunk of req) {
-    const b = chunk as Buffer;
-    size += b.length;
-    if (size > limit) throw new Error('body too large');
-    chunks.push(b);
-  }
-  return Buffer.concat(chunks);
+  // Event listeners instead of `for await`: the async-iterator protocol
+  // costs a surprising amount per request on tiny bodies (the hot paths
+  // read 1 KiB packs and ~100 B JSON bodies).
+  return new Promise<Buffer>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let done = false;
+    req.on('data', (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > limit) {
+        if (!done) { done = true; reject(new Error('body too large')); }
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => { if (!done) { done = true; resolve(Buffer.concat(chunks)); } });
+    req.on('error', (err) => { if (!done) { done = true; reject(err); } });
+  });
 }
 
 async function readJsonBody(ctx: Ctx): Promise<{ ok: true; value: unknown } | { ok: false }> {
@@ -668,6 +836,29 @@ function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
     author_association: 'OWNER',
     state_reason: issue.state === 'closed' ? 'completed' : null,
   };
+}
+
+/** Serialized REST JSON for one issue, cached on the issue after first build. */
+function issueJsonBuf(repo: Repo, issue: Issue): Buffer {
+  if (issue.jsonCache) return issue.jsonCache;
+  const buf = Buffer.from(`${JSON.stringify(issueJson(repo, issue))}\n`, 'utf8');
+  issue.jsonCache = buf;
+  return buf;
+}
+
+/** Drop an issue's cached JSON after any mutation (state, title, body, comments). */
+function invalidateIssue(issue: Issue): void {
+  issue.jsonCache = null;
+}
+
+function sendIssue(ctx: Ctx, status: number, repo: Repo, issue: Issue): void {
+  const body = issueJsonBuf(repo, issue);
+  ctx.res.writeHead(status, {
+    'content-type': JSON_TYPE,
+    'content-length': String(body.length),
+    'x-github-request-id': `req-${++reqCounter}`,
+  });
+  ctx.res.end(body);
 }
 
 function pullJson(repo: Repo, pr: Pull): Record<string, unknown> {
@@ -1299,9 +1490,10 @@ async function handleRest(ctx: Ctx): Promise<boolean> {
             id: nextGlobalId++, number: repo.nextIssue++, title: body.value.title,
             body: typeof body.value.body === 'string' ? body.value.body : '',
             state: 'open', labels, user: VIEWER_LOGIN, createdSeq: ++seq, comments: [],
+            jsonCache: null,
           };
           repo.issues.push(issue);
-          sendJson(ctx.res, 201, issueJson(repo, issue));
+          sendIssue(ctx, 201, repo, issue);
           return true;
         }
       }
@@ -1309,7 +1501,7 @@ async function handleRest(ctx: Ctx): Promise<boolean> {
       const issue = Number.isInteger(num) ? repo.issues.find((i) => i.number === num) : undefined;
       if (tail.length === 2) {
         if (!issue) { errJson(ctx.res, 404, 'Not Found'); return true; }
-        if (m === 'GET') { sendJson(ctx.res, 200, issueJson(repo, issue)); return true; }
+        if (m === 'GET') { sendIssue(ctx, 200, repo, issue); return true; }
         if (m === 'PATCH') {
           const body = await readJsonBody(ctx);
           if (!body.ok) { errJson(ctx.res, 400, 'Problems parsing JSON'); return true; }
@@ -1318,7 +1510,8 @@ async function handleRest(ctx: Ctx): Promise<boolean> {
             if (typeof body.value.title === 'string') issue.title = body.value.title;
             if (typeof body.value.body === 'string') issue.body = body.value.body;
           }
-          sendJson(ctx.res, 200, issueJson(repo, issue));
+          invalidateIssue(issue);
+          sendIssue(ctx, 200, repo, issue);
           return true;
         }
       }
@@ -1341,6 +1534,7 @@ async function handleRest(ctx: Ctx): Promise<boolean> {
           }
           const comment: Comment = { id: repo.nextComment++, body: body.value.body, user: VIEWER_LOGIN, createdSeq: ++seq };
           issue.comments.push(comment);
+          invalidateIssue(issue);
           sendJson(ctx.res, 201, {
             id: comment.id, node_id: globalId('IssueComment', repo.id, issue.number, comment.id),
             url: '', html_url: '', body: comment.body,
@@ -1472,8 +1666,8 @@ function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-p
   return Buffer.concat(parts);
 }
 
-function v2Advertisement(): Buffer {
-  const lines = [
+const V2_ADVERTISEMENT: Buffer = Buffer.concat([
+  ...[
     'version 2\n',
     'agent=github-forge/1.0.0\n',
     'ls-refs=unborn\n',
@@ -1481,8 +1675,24 @@ function v2Advertisement(): Buffer {
     'server-option\n',
     'object-format=sha1\n',
     'object-info\n',
-  ];
-  return Buffer.concat([...lines.map((l) => pktLine(l)), PKT_FLUSH]);
+  ].map((l) => pktLine(l)),
+  PKT_FLUSH,
+]);
+
+/** Refs snapshot: sorted `name=oid` pairs. A fetch/advertisement response is a
+ *  pure function of the refs, the object count and the request, so this plus
+ *  the request args is an exact cache key (objects only ever grow). */
+function refsFingerprint(repo: Repo): string {
+  return [...repo.refs.entries()].sort(([a], [b]) => (a < b ? -1 : 1)).map(([n, o]) => `${n}=${o}`).join(',');
+}
+
+/** Bounded cache put (FIFO eviction, keeps the newest 16 entries). */
+function cachePut(cache: Map<string, Buffer>, key: string, value: Buffer): void {
+  if (cache.size >= 16) {
+    const first = cache.keys().next().value;
+    if (first !== undefined) cache.delete(first);
+  }
+  cache.set(key, value);
 }
 
 function sidebandPack(pack: Buffer, chunkSize = 65500): Buffer[] {
@@ -1515,8 +1725,9 @@ function planFetch(repo: Repo, wants: string[], haves: string[], depth: number |
     {
       const seen = new Set<string>();
       const queue = [...haves];
-      while (queue.length > 0) {
-        const oid = queue.shift()!;
+      let head = 0;
+      while (head < queue.length) {
+        const oid = queue[head++]!;
         if (seen.has(oid)) continue;
         seen.add(oid);
         const obj = repo.objects.get(oid);
@@ -1569,8 +1780,9 @@ function planFetch(repo: Repo, wants: string[], haves: string[], depth: number |
   }
   const commits: string[] = [];
   const shallow: string[] = [];
-  while (queue.length > 0) {
-    const oid = queue.shift()!;
+  let qhead = 0;
+  while (qhead < queue.length) {
+    const oid = queue[qhead++]!;
     const g = gen.get(oid)!;
     commits.push(oid);
     const parents = commitParents(repo, oid);
@@ -1658,6 +1870,13 @@ async function handleGitUploadPack(ctx: Ctx, repo: Repo, body: Buffer): Promise<
         else if (t === 'peel') peel = true;
         else if (t === 'symrefs') symrefs = true;
       }
+      // ls-refs is a pure function of the refs + the three flags: cache it.
+      const lsKey = `ls:${refsFingerprint(repo)}:${prefixes.join(',')}:${peel}:${symrefs}`;
+      const cachedLs = repo.packCache.get(lsKey);
+      if (cachedLs) {
+        sendRaw(ctx.res, 200, cachedLs, 'application/x-git-upload-pack-result');
+        return;
+      }
       const parts: Buffer[] = [];
       const headTip = defaultBranchTip(repo);
       const headAllowed = prefixes.length === 0 || prefixes.some((pre) => 'HEAD'.startsWith(pre));
@@ -1680,11 +1899,22 @@ async function handleGitUploadPack(ctx: Ctx, repo: Repo, body: Buffer): Promise<
         parts.push(pktLine(`${line}\n`));
       }
       parts.push(PKT_FLUSH);
-      sendRaw(ctx.res, 200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
+      const lsBody = Buffer.concat(parts);
+      cachePut(repo.packCache, lsKey, lsBody);
+      sendRaw(ctx.res, 200, lsBody, 'application/x-git-upload-pack-result');
       return;
     }
     if (command === 'fetch') {
       const args = parseV2FetchArgs(dataLines);
+      // The whole fetch response (acks + shallow lines + pack) is a pure
+      // function of the request args + refs + object set: cache it, so 50
+      // identical shallow clones share one planFetch + writePack.
+      const fetchKey = `f2:${refsFingerprint(repo)}:${repo.objects.size}:${args.wants.join(',')}:${args.haves.join(',')}:${args.depth}:${args.shallow.join(',')}:${args.filter ?? ''}`;
+      const cachedFetch = repo.packCache.get(fetchKey);
+      if (cachedFetch) {
+        sendRaw(ctx.res, 200, cachedFetch, 'application/x-git-upload-pack-result');
+        return;
+      }
       const plan = planFetch(repo, args.wants, args.haves, args.depth, args.shallow);
       const pack = writePack(plan.objects);
       const parts: Buffer[] = [];
@@ -1704,7 +1934,9 @@ async function handleGitUploadPack(ctx: Ctx, repo: Repo, body: Buffer): Promise<
       parts.push(pktLine('packfile\n'));
       for (const p of sidebandPack(pack)) parts.push(p);
       parts.push(PKT_FLUSH);
-      sendRaw(ctx.res, 200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
+      const fetchBody = Buffer.concat(parts);
+      cachePut(repo.packCache, fetchKey, fetchBody);
+      sendRaw(ctx.res, 200, fetchBody, 'application/x-git-upload-pack-result');
       return;
     }
     errJson(ctx.res, 400, 'unknown v2 command');
@@ -1728,6 +1960,12 @@ async function handleGitUploadPack(ctx: Ctx, repo: Repo, body: Buffer): Promise<
       if (t.startsWith('have ')) haves.push(t.slice(5).trim());
     }
   }
+  const fetch0Key = `f0:${refsFingerprint(repo)}:${repo.objects.size}:${wants.join(',')}:${haves.join(',')}:${depth}:${shallowIn.join(',')}`;
+  const cachedFetch0 = repo.packCache.get(fetch0Key);
+  if (cachedFetch0) {
+    sendRaw(ctx.res, 200, cachedFetch0, 'application/x-git-upload-pack-result');
+    return;
+  }
   const plan = planFetch(repo, wants, haves, depth, shallowIn);
   const pack = writePack(plan.objects);
   const parts: Buffer[] = [];
@@ -1739,7 +1977,9 @@ async function handleGitUploadPack(ctx: Ctx, repo: Repo, body: Buffer): Promise<
   for (const s of plan.unshallow) parts.push(pktLine(`unshallow ${s}\n`));
   for (const p of sidebandPack(pack)) parts.push(p);
   parts.push(PKT_FLUSH);
-  sendRaw(ctx.res, 200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
+  const fetch0Body = Buffer.concat(parts);
+  cachePut(repo.packCache, fetch0Key, fetch0Body);
+  sendRaw(ctx.res, 200, fetch0Body, 'application/x-git-upload-pack-result');
 }
 
 async function handleGitReceivePack(ctx: Ctx, repo: Repo, body: Buffer): Promise<void> {
@@ -1796,12 +2036,13 @@ async function handleGitReceivePack(ctx: Ctx, repo: Repo, body: Buffer): Promise
   const reportLines: string[] = [];
   if (unpackOk) {
     // Validate that every new tip's closure is present (incoming + existing).
+    // Only objects the push itself brings need their closure walked: an
+    // object already in the store had its closure validated when stored, so
+    // the walk stops at it instead of re-walking the whole history per push.
     for (const cmd of commands) {
       if (cmd.newOid === ZERO_OID) continue;
-      const combined = new Map(repo.objects);
-      for (const [oid, obj] of incoming) combined.set(oid, obj);
       try {
-        const missing = collectMissing(combined, cmd.newOid);
+        const missing = collectMissing(repo.objects, incoming, cmd.newOid);
         if (missing.length > 0) throw new Error(`missing object ${missing[0]}`);
       } catch (e) {
         unpackOk = false;
@@ -1861,15 +2102,23 @@ async function handleGitReceivePack(ctx: Ctx, repo: Repo, body: Buffer): Promise
   sendRaw(ctx.res, 200, Buffer.concat(out), 'application/x-git-receive-pack-result');
 }
 
-function collectMissing(objects: Map<string, GitObject>, root: string): string[] {
+/**
+ * Objects reachable from `root` that are in neither `existing` nor `incoming`.
+ * Only `incoming` objects are descended into: an object already in `existing`
+ * had its closure validated when it was stored, so its subtree is complete
+ * by induction and re-walking it on every push is pure O(history) waste.
+ */
+function collectMissing(existing: Map<string, GitObject>, incoming: Map<string, GitObject>, root: string): string[] {
   const missing: string[] = [];
   const seen = new Set<string>();
+  const get = (oid: string): GitObject | undefined => incoming.get(oid) ?? existing.get(oid);
   const visitCommit = (oid: string): void => {
     if (seen.has(oid)) return;
     seen.add(oid);
-    const obj = objects.get(oid);
+    const obj = get(oid);
     if (!obj) { missing.push(oid); return; }
     if (obj.type !== 'commit') return;
+    if (!incoming.has(oid)) return; // pre-existing commit: closure complete
     const view = parseCommit(obj.data);
     visitTree(view.tree);
     for (const p of view.parents) visitCommit(p);
@@ -1877,21 +2126,22 @@ function collectMissing(objects: Map<string, GitObject>, root: string): string[]
   const visitTree = (oid: string): void => {
     if (seen.has(oid)) return;
     seen.add(oid);
-    const obj = objects.get(oid);
+    const obj = get(oid);
     if (!obj) { missing.push(oid); return; }
     if (obj.type !== 'tree') return;
+    if (!incoming.has(oid)) return; // pre-existing tree: closure complete
     for (const e of parseTree(obj.data)) {
       if (e.mode === '40000') visitTree(e.oid);
-      else if (!objects.has(e.oid)) missing.push(e.oid);
+      else if (!get(e.oid)) missing.push(e.oid);
     }
   };
-  const rootObj = objects.get(root);
+  const rootObj = get(root);
   if (!rootObj) return [root];
   if (rootObj.type === 'commit') visitCommit(root);
   else if (rootObj.type === 'tree') visitTree(root);
   else if (rootObj.type === 'tag') {
     const target = parseTag(rootObj.data).object;
-    const t = objects.get(target);
+    const t = get(target);
     if (!t) missing.push(target);
     else if (t.type === 'commit') visitCommit(target);
   }
@@ -1912,15 +2162,21 @@ async function handleGit(ctx: Ctx): Promise<boolean> {
       return true;
     }
     if (service === 'git-receive-pack') {
-      sendRaw(ctx.res, 200, v0Advertisement(repo, 'git-receive-pack'), 'application/x-git-receive-pack-advertisement');
+      const key = `recv:${refsFingerprint(repo)}`;
+      let adv = repo.advCache.get(key);
+      if (!adv) { adv = v0Advertisement(repo, 'git-receive-pack'); cachePut(repo.advCache, key, adv); }
+      sendRaw(ctx.res, 200, adv, 'application/x-git-receive-pack-advertisement');
       return true;
     }
     if (service === 'git-upload-pack') {
       const isV2 = (ctx.req.headers['git-protocol'] ?? '') === 'version=2';
       if (isV2) {
-        sendRaw(ctx.res, 200, v2Advertisement(), 'application/x-git-upload-pack-advertisement');
+        sendRaw(ctx.res, 200, V2_ADVERTISEMENT, 'application/x-git-upload-pack-advertisement');
       } else {
-        sendRaw(ctx.res, 200, v0Advertisement(repo, 'git-upload-pack'), 'application/x-git-upload-pack-advertisement');
+        const key = `up:${refsFingerprint(repo)}`;
+        let adv = repo.advCache.get(key);
+        if (!adv) { adv = v0Advertisement(repo, 'git-upload-pack'); cachePut(repo.advCache, key, adv); }
+        sendRaw(ctx.res, 200, adv, 'application/x-git-upload-pack-advertisement');
       }
       return true;
     }
@@ -2374,6 +2630,7 @@ function executeOperation(doc: GqlDoc, variables: Record<string, unknown>): { da
           title: typeof input?.title === 'string' ? input.title : '',
           body: typeof input?.body === 'string' ? input.body : '',
           state: 'open', labels: [], user: VIEWER_LOGIN, createdSeq: ++seq, comments: [],
+          jsonCache: null,
         };
         repo.issues.push(issue);
         const inner: Record<string, unknown> = {};
@@ -2392,6 +2649,7 @@ function executeOperation(doc: GqlDoc, variables: Record<string, unknown>): { da
         }
         if (!found) { data[key] = null; gctx.errors.push({ message: 'Could not resolve to an Issue with the global id.' }); continue; }
         found.issue.state = 'closed';
+        invalidateIssue(found.issue);
         const inner: Record<string, unknown> = {};
         for (const child of f.children) {
           if (child.name === 'issue') inner[child.alias ?? 'issue'] = resolveIssueFields(found.repo, found.issue, child.children, gctx);
@@ -2449,6 +2707,7 @@ function executeOperation(doc: GqlDoc, variables: Record<string, unknown>): { da
         if (!found) { data[key] = null; gctx.errors.push({ message: 'Could not resolve to an Issue with the global id.' }); continue; }
         const comment: Comment = { id: found.repo.nextComment++, body: typeof input?.body === 'string' ? input.body : '', user: VIEWER_LOGIN, createdSeq: ++seq };
         found.issue.comments.push(comment);
+        invalidateIssue(found.issue);
         const inner: Record<string, unknown> = {};
         for (const child of f.children) {
           if (child.name === 'commentEdge') {
@@ -2720,6 +2979,7 @@ function mcpCallTool(name: string, args: Record<string, unknown>): { result?: Re
         id: nextGlobalId++, number: repo.nextIssue++,
         title: String(args.title ?? ''), body: typeof args.body === 'string' ? args.body : '',
         state: 'open', labels: [], user: VIEWER_LOGIN, createdSeq: ++seq, comments: [],
+        jsonCache: null,
       };
       repo.issues.push(issue);
       return { result: mcpToolResult(issueJson(repo, issue)) };
@@ -2876,8 +3136,47 @@ async function handleMcp(ctx: Ctx): Promise<boolean> {
 // ---------------------------------------------------------------------------
 // server
 
+// Fast path for the read workload: GET /api/v3/repos/{owner}/{repo}/issues/{n}
+// with no query string. Serves the issue's cached JSON without URL parsing,
+// the git/GraphQL/MCP dispatch or the generic REST router. Anything that does
+// not match exactly (other owners, missing repo/issue, empty cache, no auth)
+// returns false and the request falls through to the normal handlers.
+function tryFastIssueGet(req: IncomingMessage, res: ServerResponse): boolean {
+  if (req.method !== 'GET') return false;
+  const url = req.url ?? '';
+  if (url.includes('?')) return false;
+  const m = /^\/api\/v3\/repos\/([^/]+)\/([^/]+)\/issues\/(\d+)$/.exec(url);
+  if (!m) return false;
+  let owner = m[1]!;
+  let name = m[2]!;
+  try { owner = decodeURIComponent(owner); name = decodeURIComponent(name); } catch { return false; }
+  if (owner !== VIEWER_LOGIN) return false;
+  if (TOKEN !== '') {
+    const h = req.headers.authorization ?? '';
+    if (!h.startsWith('Bearer ')) return false;
+    const tok = h.slice(7);
+    if (tok.length !== TOKEN.length) return false;
+    try {
+      if (!timingSafeEqual(Buffer.from(tok), Buffer.from(TOKEN))) return false;
+    } catch { return false; }
+  }
+  const repo = getRepo(owner, name);
+  if (!repo) return false;
+  const issue = repo.issues.find((i) => i.number === Number(m[3]));
+  if (!issue || !issue.jsonCache) return false;
+  const body = issue.jsonCache;
+  res.writeHead(200, {
+    'content-type': JSON_TYPE,
+    'content-length': String(body.length),
+    'x-github-request-id': `req-${++reqCounter}`,
+  });
+  res.end(body);
+  return true;
+}
+
 export function createApp(): Server {
   return createServer((req: IncomingMessage, res: ServerResponse) => {
+    if (tryFastIssueGet(req, res)) return;
     void (async (): Promise<void> => {
       try {
         const url = new URL(req.url ?? '/', 'http://entry');
